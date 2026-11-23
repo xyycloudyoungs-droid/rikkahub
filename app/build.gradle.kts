@@ -52,30 +52,31 @@ android {
         create("release") {
             val localProperties = Properties()
             val localPropertiesFile = rootProject.file("local.properties")
-
             if (localPropertiesFile.exists()) {
                 localProperties.load(FileInputStream(localPropertiesFile))
+            }
 
-                val storeFilePath = localProperties.getProperty("storeFile")
-                val storePasswordValue = localProperties.getProperty("storePassword")
-                val keyAliasValue = localProperties.getProperty("keyAlias")
-                val keyPasswordValue = localProperties.getProperty("keyPassword")
-
-                if (storeFilePath != null && storePasswordValue != null &&
-                    keyAliasValue != null && keyPasswordValue != null
-                ) {
-                    storeFile = file(storeFilePath)
-                    storePassword = storePasswordValue
-                    keyAlias = keyAliasValue
-                    keyPassword = keyPasswordValue
-                }
+            // CI 的 debug 测试构建没有 release keystore：缺省值留空，避免 release 签名配置影响 debug 构建
+            val storeFilePath = localProperties.getProperty("storeFile")
+            val storePasswordValue = localProperties.getProperty("storePassword")
+            val keyAliasValue = localProperties.getProperty("keyAlias")
+            val keyPasswordValue = localProperties.getProperty("keyPassword")
+            if (!storeFilePath.isNullOrBlank()) {
+                storeFile = file(storeFilePath)
+                storePassword = storePasswordValue.orEmpty()
+                keyAlias = keyAliasValue.orEmpty()
+                keyPassword = keyPasswordValue.orEmpty()
             }
         }
     }
 
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("release")
+            // 没有 release keystore 时不绑定空签名配置，debug 测试构建不受影响
+            val releaseSigning = signingConfigs.getByName("release")
+            if (releaseSigning.storeFile != null) {
+                signingConfig = releaseSigning
+            }
             optimization {
                 enable = true
             }
