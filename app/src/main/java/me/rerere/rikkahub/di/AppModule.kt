@@ -6,6 +6,7 @@ import com.google.firebase.crashlytics.crashlytics
 import kotlinx.serialization.json.Json
 import me.rerere.rikkahub.AppScope
 import me.rerere.rikkahub.data.ai.ChatRequestFactory
+import me.rerere.rikkahub.data.ai.delegation.AssistantDelegationService
 import me.rerere.rikkahub.data.ai.tools.ChatToolFactory
 import me.rerere.rikkahub.data.ai.tools.local.LocalTools
 import me.rerere.rikkahub.data.event.AppEventBus
@@ -108,6 +109,15 @@ val appModule = module {
     }
 
     single {
+        AssistantDelegationService(
+            settingsStore = get(),
+            conversationRepository = get(),
+            // 延迟解析，避免 ChatService -> ChatRequestFactory -> ChatToolFactory 的循环依赖
+            requestFactory = lazy { get() },
+        )
+    }
+
+    single {
         ChatToolFactory(
             context = get(),
             memoryRepository = get(),
@@ -117,6 +127,8 @@ val appModule = module {
             skillManager = get(),
             workspaceRepository = get(),
             backgroundShellManager = get(),
+            // 工具执行时才解析，和上面的延迟解析一起打破循环
+            assistantDelegationService = lazy { get() },
         )
     }
 

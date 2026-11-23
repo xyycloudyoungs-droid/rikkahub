@@ -2,11 +2,19 @@ package me.rerere.rikkahub.data.ai.tools
 
 import android.content.Context
 import android.util.Log
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import me.rerere.ai.core.InputSchema
 import me.rerere.ai.core.Tool
 import me.rerere.ai.provider.BuiltInTools
 import me.rerere.ai.provider.Model
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.rikkahub.data.ai.delegation.AssistantDelegationScope
+import me.rerere.rikkahub.data.ai.delegation.AssistantDelegationService
+import me.rerere.rikkahub.data.ai.delegation.toToolOutput
 import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.ai.tools.local.LocalTools
 import me.rerere.rikkahub.data.datastore.Settings
@@ -46,6 +54,7 @@ class ChatToolFactory(
     private val skillManager: SkillManager,
     private val workspaceRepository: WorkspaceRepository,
     private val backgroundShellManager: BackgroundShellManager,
+    private val assistantDelegationService: Lazy<AssistantDelegationService>,
 ) {
     suspend fun createTools(
         settings: Settings,
@@ -64,6 +73,10 @@ class ChatToolFactory(
                 addAll(createSearchTools(settings))
             }
             addAll(localTools.getTools(assistant.localTools))
+            // 子会话不能再分派，避免总管 -> 子助手 -> 子助手无限套娃
+            if (!AssistantDelegationScope.isDelegatedSubConversation(conversationId)) {
+                addAll(createAssistantDelegationTool(settings, assistant, conversationId))
+            }
             if (assistant.enableRecentChatsReference) {
                 addAll(createConversationTools(conversationRepository, assistant.id))
             }
@@ -102,6 +115,110 @@ class ChatToolFactory(
         val canReadToolOutputs = workspaceTools.isNotEmpty() &&
             assistant.workspaceId?.let { workspaceRepository.getById(it.toString()) }?.capabilities()?.rootfs == true
         return if (canReadToolOutputs) tools.map(::withOutputTruncation) else tools
+    }
+
+    /**
+     * 把子任务分派给 App 内另一个助手，同步等待结果。
+     *
+     * 目前所有助手都会看到这个工具，没有助手级开关；子会话靠 [AssistantDelegationScope]
+     * 排除在外，所以总管 -> 子助手 -> 子助手不会无限套娃。
+     */
+    private fun createAssistantDelegationTool(
+        settings: Settings,
+        assistant: Assistant,
+        conversationId: Uuid,
+    ): List<Tool> {
+        val candidates = settings.assistants.filter { it.id != assistant.id }
+        if (candidates.isEmpty()) return emptyList()
+
+        return listOf(
+            Tool(
+                name = "delegate_task",
+                description = """
+                    Delegate a self-contained sub-task to another assistant in this app.
+                    The sub-task runs in a separate background conversation with that assistant's own model, system prompt, tools and memory.
+                    This call waits until the sub-task finishes and returns its final result.
+                    Use it when the task is better handled by a specialized assistant, or when a part of the work can be done independently.
+                    Only use it when the user asks you to coordinate other assistants, or when the task clearly needs a specialized assistant; do not use it for ordinary conversation.
+                    You must pass an assistant id from the available list. Write a complete task: the sub-assistant cannot see this conversation.
+                """.trimIndent(),
+                systemPrompt = { _, _ ->
+                    buildString {
+                        appendLine("**Delegation**")
+                        appendLine("You can delegate self-contained sub-tasks to these assistants with the `delegate_task` tool:")
+                        appendLine("<available_assistants>")
+                        candidates.forEach { candidate ->
+                            appendLine("  <assistant>")
+                            appendLine("    <id>${candidate.id}</id>")
+                            appendLine(
+                                "    <name>${
+                                    candidate.name.ifBlank { "Unnamed assistant" }.take(100).escapeXml()
+                                }</name>"
+                            )
+                            appendLine("  </assistant>")
+                        }
+                        append("</available_assistants>")
+                        appendLine()
+                    }
+                },
+                parameters = {
+                    InputSchema.Obj(
+                        properties = buildJsonObject {
+                            put("assistant_id", buildJsonObject {
+                                put("type", "string")
+                                put("description", "Id of the assistant that should execute the sub-task.")
+                            })
+                            put("task", buildJsonObject {
+                                put("type", "string")
+                                put(
+                                    "description",
+                                    "A complete, self-contained description of the sub-task. Include all context the sub-assistant needs."
+                                )
+                            })
+                            put("context", buildJsonObject {
+                                put("type", "string")
+                                put("description", "Optional background, constraints or style requirements.")
+                            })
+                            put("expected_output", buildJsonObject {
+                                put("type", "string")
+                                put("description", "Optional description of the expected output format.")
+                            })
+                        },
+                        required = listOf("assistant_id", "task")
+                    )
+                },
+                execute = { args ->
+                    val json = args.jsonObject
+                    val assistantIdText = json["assistant_id"]?.jsonPrimitive?.contentOrNull
+                        ?: error("assistant_id is required")
+                    val targetId = runCatching { Uuid.parse(assistantIdText) }.getOrNull()
+                        ?: error("Invalid assistant_id: $assistantIdText")
+                    val task = json["task"]?.jsonPrimitive?.contentOrNull
+                        ?: error("task is required")
+                    val contextText = json["context"]?.jsonPrimitive?.contentOrNull
+                    val expectedOutput = json["expected_output"]?.jsonPrimitive?.contentOrNull
+                    val result = assistantDelegationService.value.delegate(
+                        managerConversationId = conversationId,
+                        targetAssistantId = targetId,
+                        task = task,
+                        context = contextText,
+                        expectedOutput = expectedOutput,
+                    )
+                    listOf(UIMessagePart.Text(result.toToolOutput()))
+                }
+            )
+        )
+    }
+
+    private fun String.escapeXml(): String = buildString(length) {
+        for (c in this@escapeXml) {
+            when (c) {
+                '&' -> append("&amp;")
+                '<' -> append("&lt;")
+                '>' -> append("&gt;")
+                else -> append(c)
+            }
+        }
     }
 
     private fun withOutputTruncation(tool: Tool): Tool {
